@@ -2,6 +2,8 @@
 
 A **security-first Windows Desktop AI Agent** that uses natural language to launch applications. Built with a strict separation between application discovery (Phase 1) and agentic execution (Phase 2).
 
+![terminalImage](image-1.png)
+
 ## 🔒 Security Philosophy: The Binary Boundary
 
 This project implements a **"Safety by Design"** architecture that fundamentally separates two critical concerns:
