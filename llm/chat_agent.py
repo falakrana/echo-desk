@@ -13,9 +13,11 @@ when the user wants to open an application.
 import os
 import json
 import logging
+import re
 from typing import Dict, List, Optional, Any
 from pathlib import Path
 from dotenv import load_dotenv
+from system.app_finder import AppFinder
 
 # LangChain imports
 try:
@@ -56,10 +58,14 @@ class ConversationalAgent:
         self.chat_history: List[Any] = []
         self.available_apps: Dict[str, str] = {}
         self.launch_tool = None
+        self.check_tool = None
+        self.deep_search_tool = None
+        self.app_finder: Optional[AppFinder] = None
         
         # Load registry
         if registry_path and registry_path.exists():
             self._load_registry(registry_path)
+            self.app_finder = AppFinder(registry_path=registry_path)
         
         # Initialize LLM and agent
         if LANGCHAIN_AVAILABLE:
@@ -131,6 +137,84 @@ class ConversationalAgent:
             })
         
         return launch_application
+
+    def _create_check_tool(self):
+        """Create a tool for checking app presence in registry."""
+        app_finder = self.app_finder
+
+        @tool
+        def check_application_presence(app_name: str) -> str:
+            """Check if an application is available in the registry.
+
+            Use this when user asks if an app exists/is installed/available.
+            """
+            if not app_finder:
+                return json.dumps({
+                    "action": "check_presence",
+                    "status": "error",
+                    "message": "App finder not initialized."
+                })
+
+            result = app_finder.find_in_registry(app_name)
+            if result["found"]:
+                return json.dumps({
+                    "action": "check_presence",
+                    "status": "success",
+                    "app_name": result["match_name"],
+                    "path": result["path"],
+                    "message": f"'{result['match_name']}' is available."
+                })
+
+            return json.dumps({
+                "action": "check_presence",
+                "status": "not_found",
+                "app_name": app_name,
+                "message": f"'{app_name}' was not found in the current registry."
+            })
+
+        return check_application_presence
+
+    def _create_deep_search_tool(self):
+        """Create a tool for deep-searching app executables across disk."""
+        app_finder = self.app_finder
+
+        @tool
+        def deep_search_application(app_name: str) -> str:
+            """Deep-search the device for matching .exe files.
+
+            Use this only when user explicitly asks to search the whole PC/device.
+            """
+            if not app_finder:
+                return json.dumps({
+                    "action": "deep_search",
+                    "status": "error",
+                    "message": "App finder not initialized."
+                })
+
+            result = app_finder.deep_search(app_name)
+            if result["found"]:
+                first = result["matches"][0]
+                return json.dumps({
+                    "action": "deep_search",
+                    "status": "success",
+                    "app_name": first["name"],
+                    "path": first["path"],
+                    "matches": result["matches"],
+                    "timed_out": result["timed_out"],
+                    "message": f"Found {len(result['matches'])} match(es) for '{app_name}'."
+                })
+
+            timeout_note = " (search timed out)" if result["timed_out"] else ""
+            return json.dumps({
+                "action": "deep_search",
+                "status": "not_found",
+                "app_name": app_name,
+                "matches": [],
+                "timed_out": result["timed_out"],
+                "message": f"No executable match found for '{app_name}'{timeout_note}."
+            })
+
+        return deep_search_application
     
     def _initialize_agent(self) -> None:
         """Initialize the LLM and bind tools."""
@@ -141,17 +225,133 @@ class ConversationalAgent:
                 return
             
             self.launch_tool = self._create_launch_tool()
+            self.check_tool = self._create_check_tool()
+            self.deep_search_tool = self._create_deep_search_tool()
             self.llm = ChatGroq(
                 model=self.llm_model,
                 api_key=api_key,
                 temperature=0.7,
-            ).bind_tools([self.launch_tool])
+            ).bind_tools([self.launch_tool, self.check_tool, self.deep_search_tool])
             
             logger.info(f"Conversational agent initialized with {self.llm_model}")
             
         except Exception as e:
             logger.error(f"Failed to initialize agent: {e}")
             logger.exception(e)
+
+    def _extract_app_name_from_text(self, user_input: str) -> Optional[str]:
+        """Extract probable app name from user text."""
+        text = (user_input or "").strip().lower()
+        if not text:
+            return None
+
+        patterns = [
+            r"(?:open|launch|start|run|use)\s+(.+)$",
+            r"(?:is|do i have|check if)\s+(.+?)\s+(?:installed|present|available)\??$",
+            r"(?:search|find)\s+(.+?)\s+(?:on|in)\s+(?:my\s+)?(?:pc|device|computer|system)\??$",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                candidate = match.group(1).strip(" .!?")
+                # Trim common leading qualifiers.
+                candidate = re.sub(r"^(the|an|a)\s+", "", candidate).strip()
+                return candidate or None
+        return None
+
+    def _fallback_action_from_text(self, user_input: str, error_text: str) -> Dict[str, Any]:
+        """
+        Fallback path when LLM tool calling fails.
+        Uses deterministic parsing + AppFinder to avoid hard failure.
+        """
+        text = (user_input or "").lower().strip()
+        app_name = self._extract_app_name_from_text(user_input) or ""
+
+        is_deep_search = any(k in text for k in ["whole pc", "whole device", "entire device", "search my pc", "search my device"])
+        is_presence_check = any(k in text for k in ["installed", "present", "available", "do i have", "is there"])
+        is_launch = any(k in text for k in ["open", "launch", "start", "run", "use"])
+
+        if not self.app_finder:
+            return {
+                "response": "I hit a tool-call issue and fallback is unavailable right now.",
+                "action": None,
+                "error": f"LLM tool-call failure: {error_text}",
+            }
+
+        if is_deep_search and app_name:
+            deep = self.app_finder.deep_search(app_name)
+            if deep.get("found"):
+                first = deep["matches"][0]
+                return {
+                    "response": f"I hit a tool-call issue, so I used fallback search and found {first['name']}.",
+                    "action": {
+                        "action": "deep_search",
+                        "status": "success",
+                        "app_name": first["name"],
+                        "path": first["path"],
+                        "matches": deep["matches"],
+                        "timed_out": deep["timed_out"],
+                        "message": f"Found {len(deep['matches'])} match(es) for '{app_name}'.",
+                    },
+                    "error": None,
+                }
+            return {
+                "response": f"I hit a tool-call issue, and fallback search did not find '{app_name}'.",
+                "action": {
+                    "action": "deep_search",
+                    "status": "not_found",
+                    "app_name": app_name,
+                    "matches": [],
+                    "timed_out": deep["timed_out"],
+                    "message": f"No executable match found for '{app_name}'.",
+                },
+                "error": None,
+            }
+
+        if is_presence_check and app_name:
+            present = self.app_finder.find_in_registry(app_name)
+            if present.get("found"):
+                return {
+                    "response": f"I hit a tool-call issue, but fallback check says '{present['match_name']}' is available.",
+                    "action": {
+                        "action": "check_presence",
+                        "status": "success",
+                        "app_name": present["match_name"],
+                        "path": present["path"],
+                        "message": f"'{present['match_name']}' is available.",
+                    },
+                    "error": None,
+                }
+            return {
+                "response": f"I hit a tool-call issue, and '{app_name}' is not in the current registry.",
+                "action": {
+                    "action": "check_presence",
+                    "status": "not_found",
+                    "app_name": app_name,
+                    "message": f"'{app_name}' was not found in the current registry.",
+                },
+                "error": None,
+            }
+
+        if is_launch and app_name:
+            present = self.app_finder.find_in_registry(app_name)
+            launch_name = present["match_name"] if present.get("found") else app_name
+            return {
+                "response": f"I hit a tool-call issue, so I switched to fallback launch flow for '{launch_name}'.",
+                "action": {
+                    "action": "launch",
+                    "status": "success",
+                    "app_name": launch_name,
+                    "message": f"Launching {launch_name}",
+                },
+                "error": None,
+            }
+
+        return {
+            "response": "I hit a tool-call issue. Please try rephrasing, for example: 'open vscode'.",
+            "action": None,
+            "error": None,
+        }
     
     def chat(self, user_input: str) -> Dict[str, Any]:
         """
@@ -184,10 +384,21 @@ class ConversationalAgent:
 Your capabilities:
 1. Have natural conversations about anything (weather, jokes, questions, advice, etc.)
 2. Launch applications when the user requests it
+3. Check whether an app is available
+4. Deep-search the device when user explicitly asks to search the whole device/PC
 
-When to use the launch_application tool:
+When to use tools:
+- launch_application:
 - User explicitly asks to open/launch/start/use an application
 - Examples: "open chrome", "I want to use brave", "launch notepad"
+
+- check_application_presence:
+- User asks if an app is installed/present/available
+- Examples: "is photoshop installed?", "do I have vscode?"
+
+- deep_search_application:
+- User explicitly asks for full-device search
+- Examples: "search my whole PC for photoshop", "find X on my device"
 
 When to just chat:
 - Greetings: "hello", "hi", "how are you"
@@ -203,7 +414,12 @@ Available applications: {app_list}
             messages.extend(self.chat_history)
             messages.append(HumanMessage(content=user_input))
 
-            first_response = self.llm.invoke(messages)
+            try:
+                first_response = self.llm.invoke(messages)
+            except Exception as e:
+                logger.error(f"LLM tool-call invoke failed, using fallback: {e}")
+                logger.exception(e)
+                return self._fallback_action_from_text(user_input, str(e))
 
             action_taken = None
             final_text = first_response.content if hasattr(first_response, "content") else ""
@@ -226,15 +442,31 @@ Available applications: {app_list}
                             except Exception:
                                 tool_args = {}
 
-                    if tool_name != self.launch_tool.name:
+                    known_tools = {
+                        self.launch_tool.name if self.launch_tool else "",
+                        self.check_tool.name if self.check_tool else "",
+                        self.deep_search_tool.name if self.deep_search_tool else "",
+                    }
+                    if tool_name not in known_tools:
                         continue
 
-                    tool_output = self.launch_tool.invoke(tool_args or {})
+                    target_tool = None
+                    if self.launch_tool and tool_name == self.launch_tool.name:
+                        target_tool = self.launch_tool
+                    elif self.check_tool and tool_name == self.check_tool.name:
+                        target_tool = self.check_tool
+                    elif self.deep_search_tool and tool_name == self.deep_search_tool.name:
+                        target_tool = self.deep_search_tool
+
+                    if not target_tool:
+                        continue
+
+                    tool_output = target_tool.invoke(tool_args or {})
                     tool_messages.append(ToolMessage(content=tool_output, tool_call_id=tool_call_id))
 
                     try:
                         action_data = json.loads(tool_output)
-                        if action_data.get("action") == "launch":
+                        if action_data.get("action") in {"launch", "check_presence", "deep_search"}:
                             action_taken = action_data
                     except Exception:
                         pass
@@ -242,6 +474,13 @@ Available applications: {app_list}
                 followup_messages: List[Any] = messages + [first_response] + tool_messages
                 final_response = self.llm.invoke(followup_messages)
                 final_text = final_response.content if hasattr(final_response, "content") else final_text
+            else:
+                # If no tool call is returned for an obvious action request, use deterministic fallback.
+                lowered = user_input.lower()
+                if any(k in lowered for k in ["open ", "launch ", "start ", "run ", "use ", "installed", "present", "whole pc", "whole device"]):
+                    fallback = self._fallback_action_from_text(user_input, "no_tool_call")
+                    if fallback.get("action"):
+                        return fallback
 
             self.chat_history.append(HumanMessage(content=user_input))
             self.chat_history.append(AIMessage(content=final_text))

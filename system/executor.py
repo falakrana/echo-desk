@@ -193,6 +193,76 @@ class SafeExecutor:
                 'dry_run': False
             }
     
+    def execute_command(self, command: str, timeout_seconds: int = 30) -> Dict[str, any]:
+        """
+        Execute an explicit shell command.
+
+        Intended for explicit `cmd:` mode only, after user confirmation.
+        """
+        if not isinstance(command, str) or not command.strip():
+            return {
+                'success': False,
+                'message': "Empty command",
+                'command': command,
+                'returncode': None,
+                'stdout': "",
+                'stderr': "",
+                'dry_run': self.dry_run
+            }
+
+        clean_command = command.strip()
+        logger.warning(f"Executing explicit command: {clean_command}")
+
+        if self.dry_run:
+            return {
+                'success': True,
+                'message': f"[DRY RUN] Would execute command: {clean_command}",
+                'command': clean_command,
+                'returncode': 0,
+                'stdout': "",
+                'stderr': "",
+                'dry_run': True
+            }
+
+        try:
+            completed = subprocess.run(
+                clean_command,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds
+            )
+            success = completed.returncode == 0
+            return {
+                'success': success,
+                'message': "Command executed successfully" if success else "Command execution failed",
+                'command': clean_command,
+                'returncode': completed.returncode,
+                'stdout': completed.stdout or "",
+                'stderr': completed.stderr or "",
+                'dry_run': False
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                'success': False,
+                'message': f"Command timed out after {timeout_seconds}s",
+                'command': clean_command,
+                'returncode': None,
+                'stdout': "",
+                'stderr': "",
+                'dry_run': False
+            }
+        except Exception as e:
+            return {
+                'success': False,
+                'message': f"Command execution error: {e}",
+                'command': clean_command,
+                'returncode': None,
+                'stdout': "",
+                'stderr': str(e),
+                'dry_run': False
+            }
+
     def get_stats(self) -> Dict[str, any]:
         """
         Get execution statistics.
